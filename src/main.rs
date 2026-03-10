@@ -1,13 +1,25 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use regex::Regex;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use walkdir::WalkDir;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FileEdit {
+    filepath: String,
+    search: String,
+    replace: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct EditResponse {
+    edits: Vec<FileEdit>,
+}
 
 /// Make edits to a local folder using LM Studio backed API
 #[derive(Parser, Debug)]
@@ -24,7 +36,7 @@ struct Args {
 
 fn build_system_prompt(current_dir: &std::path::Path) -> (String, usize) {
     let mut context = String::from(
-        "You are an expert developer. You provide code edits using a precise search and replace format.\nWhen making changes, you MUST use the following format for each file you want to edit:\n\nFile: <path/to/file>\n<<<<<<< SEARCH\n<exact lines of code to find, including whitespace>\n=======\n<new lines of code to replace it with>\n>>>>>>> REPLACE\n\nYou may include multiple SEARCH/REPLACE blocks for the same file, but each block must follow this exact format.\nEnsure that the code in the SEARCH block matches the file exactly. Do not truncate or omit parts of the block.\n\nCurrent codebase context:\n\n",
+        "You are an expert developer. You provide code edits by responding with a structured JSON object according to the schema provided.\nEnsure that the code in the search block matches the file exactly. Do not truncate or omit parts of the block.\n\nCurrent codebase context:\n\n",
     );
 
     let mut file_count = 0;
@@ -101,7 +113,34 @@ async fn main() -> Result<()> {
             "model": args.model,
             "messages": history,
             "temperature": 0.1, // Low temperature forces deterministic, factual code edits
-            "stream": false
+            "stream": false,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "edit_response",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "edits": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "filepath": {"type": "string"},
+                                        "search": {"type": "string"},
+                                        "replace": {"type": "string"}
+                                    },
+                                    "required": ["filepath", "search", "replace"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["edits"],
+                        "additionalProperties": false
+                    }
+                }
+            }
         });
 
         let res = client.post(&args.api_url).json(&payload).send().await;
@@ -169,25 +208,23 @@ fn normalize_content(content: &str) -> String {
     normalized
 }
 
-// Applies diffs found in the LLM response
+// Applies diffs found in the structured LLM response
 fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
     let mut files_changed = false;
 
-    // Pattern to match the diff blocks.
-    // File: <filepath>
-    // <<<<<<< SEARCH
-    // <search content>
-    // =======
-    // <replace content>
-    // >>>>>>> REPLACE
-    let re =
-        Regex::new(r"(?s)File:\s*([^\n]+)\n<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE")
-            .context("Failed to compile regex")?;
+    // The response string should be a JSON object conforming to `EditResponse`
+    let edit_response: EditResponse = match serde_json::from_str(response) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("Error parsing JSON response: {}", e);
+            return Ok(false);
+        }
+    };
 
-    for caps in re.captures_iter(response) {
-        let filepath = caps.get(1).map_or("", |m| m.as_str().trim());
-        let search_block = caps.get(2).map_or("", |m| m.as_str());
-        let replace_block = caps.get(3).map_or("", |m| m.as_str());
+    for edit in edit_response.edits {
+        let filepath = &edit.filepath;
+        let search_block = &edit.search;
+        let replace_block = &edit.replace;
 
         let full_path = current_dir.join(filepath);
         if !full_path.exists() {
@@ -195,7 +232,13 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
             continue;
         }
 
-        let original_content = fs::read_to_string(&full_path)?;
+        let original_content = match fs::read_to_string(&full_path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Error reading file {}: {}", filepath, e);
+                continue;
+            }
+        };
 
         let new_content = if original_content.contains(search_block) {
             // Exact match
@@ -220,9 +263,15 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
         };
 
         if original_content != new_content {
-            fs::write(&full_path, new_content)?;
-            println!("✅ Applied edit to {}", filepath);
-            files_changed = true;
+            match fs::write(&full_path, new_content) {
+                Ok(_) => {
+                    println!("✅ Applied edit to {}", filepath);
+                    files_changed = true;
+                }
+                Err(e) => {
+                    eprintln!("Error writing to file {}: {}", filepath, e);
+                }
+            }
         } else {
             println!("ℹ️ No changes needed for {}", filepath);
         }
