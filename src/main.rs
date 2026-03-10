@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use regex::Regex;
 use reqwest::Client;
 use serde_json::json;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use walkdir::WalkDir;
 
 /// Make edits to a local folder using LM Studio backed API
@@ -20,18 +22,13 @@ struct Args {
     model: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    let current_dir = env::current_dir().context("Failed to get current directory")?;
-
+fn build_system_prompt(current_dir: &std::path::Path) -> (String, usize) {
     let mut context = String::from(
-        "You are an expert developer. Provide clean, precise diffs or code edits based on the following codebase:\n\n",
+        "You are an expert developer. You provide code edits using a precise search and replace format.\nWhen making changes, you MUST use the following format for each file you want to edit:\n\nFile: <path/to/file>\n<<<<<<< SEARCH\n<exact lines of code to find, including whitespace>\n=======\n<new lines of code to replace it with>\n>>>>>>> REPLACE\n\nYou may include multiple SEARCH/REPLACE blocks for the same file, but each block must follow this exact format.\nEnsure that the code in the SEARCH block matches the file exactly. Do not truncate or omit parts of the block.\n\nCurrent codebase context:\n\n",
     );
 
-    // 1. Ingest codebase context
     let mut file_count = 0;
-    for entry in WalkDir::new(&current_dir)
+    for entry in WalkDir::new(current_dir)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
@@ -49,7 +46,7 @@ async fn main() -> Result<()> {
 
         // read_to_string natively fails on non-UTF8 files (skipping binaries/images)
         if let Ok(content) = fs::read_to_string(path) {
-            let rel_path = path.strip_prefix(&current_dir).unwrap_or(path);
+            let rel_path = path.strip_prefix(current_dir).unwrap_or(path);
             context.push_str(&format!(
                 "--- FILE: {} ---\n{}\n\n",
                 rel_path.display(),
@@ -58,6 +55,16 @@ async fn main() -> Result<()> {
             file_count += 1;
         }
     }
+
+    (context, file_count)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let current_dir = env::current_dir().context("Failed to get current directory")?;
+
+    let (context, file_count) = build_system_prompt(&current_dir);
 
     println!(
         "Loaded {} files into context. Context size: {} bytes.",
@@ -108,6 +115,25 @@ async fn main() -> Result<()> {
                     if let Some(reply) = body["choices"][0]["message"]["content"].as_str() {
                         println!("\n{}", reply);
                         history.push(json!({"role": "assistant", "content": reply}));
+
+                        // Apply diffs if found
+                        match apply_diffs(reply, &current_dir) {
+                            Ok(true) => {
+                                // Reload context
+                                let (new_context, file_count) = build_system_prompt(&current_dir);
+                                history[0] = json!({"role": "system", "content": new_context});
+                                println!(
+                                    "✅ Reloaded {} files into context after edits.",
+                                    file_count
+                                );
+                            }
+                            Ok(false) => {
+                                // No diffs applied
+                            }
+                            Err(e) => {
+                                eprintln!("Error applying diffs: {}", e);
+                            }
+                        }
                     } else {
                         eprintln!("Error: Malformed response: {}", body);
                         // Revert the last user message to avoid poisoning the history vector with unanswered prompts
@@ -126,4 +152,81 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// Helper function to normalize line endings and trim trailing whitespace
+fn normalize_content(content: &str) -> String {
+    let mut normalized = content
+        .lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if content.ends_with('\n') {
+        normalized.push('\n');
+    }
+
+    normalized
+}
+
+// Applies diffs found in the LLM response
+fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
+    let mut files_changed = false;
+
+    // Pattern to match the diff blocks.
+    // File: <filepath>
+    // <<<<<<< SEARCH
+    // <search content>
+    // =======
+    // <replace content>
+    // >>>>>>> REPLACE
+    let re =
+        Regex::new(r"(?s)File:\s*([^\n]+)\n<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE")
+            .context("Failed to compile regex")?;
+
+    for caps in re.captures_iter(response) {
+        let filepath = caps.get(1).map_or("", |m| m.as_str().trim());
+        let search_block = caps.get(2).map_or("", |m| m.as_str());
+        let replace_block = caps.get(3).map_or("", |m| m.as_str());
+
+        let full_path = current_dir.join(filepath);
+        if !full_path.exists() {
+            eprintln!("Warning: File not found: {}", filepath);
+            continue;
+        }
+
+        let original_content = fs::read_to_string(&full_path)?;
+
+        let new_content = if original_content.contains(search_block) {
+            // Exact match
+            original_content.replace(search_block, replace_block)
+        } else {
+            // Fallback: fuzzy match (normalize line endings and trailing whitespace)
+            let norm_original = normalize_content(&original_content);
+            let norm_search = normalize_content(search_block);
+
+            if norm_original.contains(&norm_search) {
+                // If fuzzy match works, we replace the fuzzy part.
+                // Note: this may alter surrounding whitespace in the original file slightly.
+                let norm_replace = normalize_content(replace_block);
+                norm_original.replace(&norm_search, &norm_replace)
+            } else {
+                eprintln!(
+                    "Warning: Search block not found in {} (even with fuzzy matching)",
+                    filepath
+                );
+                continue;
+            }
+        };
+
+        if original_content != new_content {
+            fs::write(&full_path, new_content)?;
+            println!("✅ Applied edit to {}", filepath);
+            files_changed = true;
+        } else {
+            println!("ℹ️ No changes needed for {}", filepath);
+        }
+    }
+
+    Ok(files_changed)
 }
