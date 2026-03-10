@@ -1,0 +1,4 @@
+- [ ] Edits can't be made outside of the current folder and sub-folders
+- [ ] The user can override any model parameter (especially model name and temp) through a `.model` config file
+- [ ] Unit tests
+- [ ] TBD
