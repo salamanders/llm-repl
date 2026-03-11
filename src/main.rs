@@ -99,54 +99,59 @@ async fn process_llm_interaction(
         }
     });
 
-    match client.post(&args.api_url).json(&payload).send().await {
-        Ok(response) => {
-            let status = response.status();
-            let body: serde_json::Value = response.json().await.unwrap_or(json!({}));
-
-            if status.is_success() {
-                if let Some(reply) = body["choices"][0]["message"]["content"].as_str() {
-                    println!("\n{}", reply);
-                    history.push(json!({"role": "assistant", "content": reply}));
-
-                    // Apply diffs if found
-                    match apply_diffs(reply, current_dir) {
-                        Ok((true, summary)) => {
-                            // Update history with concise summary instead of full JSON
-                            let last_idx = history.len() - 1;
-                            history[last_idx] = json!({"role": "assistant", "content": summary});
-
-                            // Reload context
-                            let (new_context, file_count) = build_system_prompt(current_dir);
-                            history[0] = json!({"role": "system", "content": new_context});
-                            println!("✅ Reloaded {} files into context after edits.", file_count);
-                        }
-                        Ok((false, summary)) => {
-                            // Update history with concise summary even if no files changed
-                            let last_idx = history.len() - 1;
-                            history[last_idx] = json!({"role": "assistant", "content": summary});
-                        }
-                        Err(e) => {
-                            eprintln!("Error applying diffs: {}", e);
-                            let error_summary = format!("Error applying edits: {}", e);
-                            let last_idx = history.len() - 1;
-                            history[last_idx] =
-                                json!({"role": "assistant", "content": error_summary});
-                        }
-                    }
-                } else {
-                    eprintln!("Error: Malformed response: {}", body);
-                    // Revert the last user message to avoid poisoning the history vector with unanswered prompts
-                    history.pop();
-                }
-            } else {
-                eprintln!("API Error: Status {}. Response: {}", status, body);
-                history.pop();
-            }
-        }
+    let response = match client.post(&args.api_url).json(&payload).send().await {
+        Ok(res) => res,
         Err(e) => {
             eprintln!("Network Error: {}", e);
             history.pop();
+            return;
+        }
+    };
+
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+
+    if !status.is_success() {
+        eprintln!("API Error: Status {}. Response: {}", status, body);
+        history.pop();
+        return;
+    }
+
+    let Some(reply) = body["choices"][0]["message"]["content"].as_str() else {
+        eprintln!("Error: Malformed response: {}", body);
+        // Revert the last user message to avoid poisoning the history vector with unanswered prompts
+        history.pop();
+        return;
+    };
+
+    println!("\n{}", reply);
+    history.push(json!({"role": "assistant", "content": reply}));
+
+    // Apply diffs if found
+    match apply_diffs(reply, current_dir) {
+        Ok((true, summary)) => {
+            // Update history with concise summary instead of full JSON
+            if let Some(last) = history.last_mut() {
+                *last = json!({"role": "assistant", "content": summary});
+            }
+
+            // Reload context
+            let (new_context, file_count) = build_system_prompt(current_dir);
+            history[0] = json!({"role": "system", "content": new_context});
+            println!("✅ Reloaded {} files into context after edits.", file_count);
+        }
+        Ok((false, summary)) => {
+            // Update history with concise summary even if no files changed
+            if let Some(last) = history.last_mut() {
+                *last = json!({"role": "assistant", "content": summary});
+            }
+        }
+        Err(e) => {
+            eprintln!("Error applying diffs: {}", e);
+            let error_summary = format!("Error applying edits: {}", e);
+            if let Some(last) = history.last_mut() {
+                *last = json!({"role": "assistant", "content": error_summary});
+            }
         }
     }
 }
@@ -201,7 +206,7 @@ fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
         return vec![];
     }
 
-    let search_lines: Vec<&str> = search.lines().map(|l| l.trim_end()).collect();
+    let search_lines: Vec<&str> = search.lines().map(str::trim_end).collect();
     if search_lines.is_empty() {
         return vec![];
     }
@@ -292,10 +297,9 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<(bool, String)> {
         }
     };
 
-    let canonical_current_dir = match current_dir.canonicalize() {
-        Ok(path) => path,
-        Err(e) => anyhow::bail!("Failed to canonicalize current directory: {}", e),
-    };
+    let canonical_current_dir = current_dir
+        .canonicalize()
+        .context("Failed to canonicalize current directory")?;
 
     for edit in edit_response.edits {
         let filepath = &edit.filepath;
@@ -309,10 +313,9 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<(bool, String)> {
             continue;
         }
 
-        let canonical_full_path = match full_path.canonicalize() {
-            Ok(path) => path,
-            Err(e) => anyhow::bail!("Failed to canonicalize path {}: {}", filepath, e),
-        };
+        let canonical_full_path = full_path
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize path {}", filepath))?;
 
         if !canonical_full_path.starts_with(&canonical_current_dir) {
             anyhow::bail!(
