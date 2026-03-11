@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use ignore::WalkBuilder;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -7,7 +8,6 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
-use walkdir::WalkDir;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct FileEdit {
@@ -40,21 +40,12 @@ fn build_system_prompt(current_dir: &std::path::Path) -> (String, usize) {
     );
 
     let mut file_count = 0;
-    for entry in WalkDir::new(current_dir)
-        .into_iter()
+    for entry in WalkBuilder::new(current_dir)
+        .build()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
     {
         let path = entry.path();
-        let path_str = path.to_string_lossy();
-
-        // Skip common large/binary/build folders
-        if path_str.contains(".git")
-            || path_str.contains("target")
-            || path_str.contains("node_modules")
-        {
-            continue;
-        }
 
         // read_to_string natively fails on non-UTF8 files (skipping binaries/images)
         if let Ok(content) = fs::read_to_string(path) {
