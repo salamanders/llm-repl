@@ -1,28 +1,24 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use async_openai::{
+    Client,
+    config::OpenAIConfig,
+    types::{
+        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+        CreateChatCompletionRequestArgs,
+    },
+};
+use clap::Parser as ClapParser;
 use ignore::WalkBuilder;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use pulldown_cmark::{Event, Parser as MarkdownParser, Tag, TagEnd};
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::path::Path;
 
-#[derive(Debug, Deserialize, Serialize)]
-struct FileEdit {
-    filepath: String,
-    search: String,
-    replace: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct EditResponse {
-    edits: Vec<FileEdit>,
-}
-
 /// Make edits to a local folder using LM Studio backed API
-#[derive(Parser, Debug)]
+#[derive(ClapParser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// The API URL to use for requests
@@ -37,7 +33,7 @@ struct Args {
 // Assembles the initial system prompt by concatenating all valid UTF-8 files to provide codebase context, isolating file ingestion from the main REPL loop.
 fn build_system_prompt(current_dir: &Path) -> (String, usize) {
     let initial_context = String::from(
-        "You are an expert developer. You provide code edits by responding with a structured JSON object according to the schema provided.\nEnsure that the code in the search block matches the file exactly. Do not truncate or omit parts of the block.\n\nCurrent codebase context:\n\n",
+        "You are an expert developer. You provide code edits by responding with a standard Unified Diff.\nEnsure that the diff can be applied directly using standard patching tools. Use the exact file paths provided in the context.\n\nCurrent codebase context:\n\n",
     );
 
     WalkBuilder::new(current_dir)
@@ -60,97 +56,99 @@ fn build_system_prompt(current_dir: &Path) -> (String, usize) {
 
 // Processes the LLM response, applies edits, and manages the history state accordingly.
 async fn process_llm_interaction(
-    client: &Client,
+    client: &Client<OpenAIConfig>,
     args: &Args,
     current_dir: &Path,
-    history: &mut Vec<serde_json::Value>,
+    history: &mut Vec<ChatCompletionRequestMessage>,
 ) {
-    let payload = json!({
-        "model": args.model,
-        "messages": history,
-        "temperature": 0.1, // Low temperature forces deterministic, factual code edits
-        "stream": false,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "edit_response",
-                "strict": true,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "edits": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "filepath": {"type": "string"},
-                                    "search": {"type": "string"},
-                                    "replace": {"type": "string"}
-                                },
-                                "required": ["filepath", "search", "replace"],
-                                "additionalProperties": false
-                            }
-                        }
-                    },
-                    "required": ["edits"],
-                    "additionalProperties": false
-                }
-            }
-        }
-    });
-
-    let response = match client.post(&args.api_url).json(&payload).send().await {
-        Ok(res) => res,
+    let request = match CreateChatCompletionRequestArgs::default()
+        .model(&args.model)
+        .messages(history.clone())
+        .temperature(0.1)
+        .build()
+    {
+        Ok(req) => req,
         Err(e) => {
-            eprintln!("Network Error: {}", e);
+            eprintln!("Error building request: {}", e);
             history.pop();
             return;
         }
     };
 
-    let status = response.status();
-    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    let response = match client.chat().create(request).await {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("API Error: {}", e);
+            history.pop();
+            return;
+        }
+    };
 
-    if !status.is_success() {
-        eprintln!("API Error: Status {}. Response: {}", status, body);
-        history.pop();
-        return;
-    }
-
-    let Some(reply) = body["choices"][0]["message"]["content"].as_str() else {
-        eprintln!("Error: Malformed response: {}", body);
-        // Revert the last user message to avoid poisoning the history vector with unanswered prompts
-        history.pop();
-        return;
+    let reply = match response
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_ref())
+    {
+        Some(content) => content.clone(),
+        None => {
+            eprintln!("Error: Response did not contain any content.");
+            history.pop();
+            return;
+        }
     };
 
     println!("\n{}", reply);
-    history.push(json!({"role": "assistant", "content": reply}));
+
+    // Let's create an assistant message for the history using the builder pattern
+    let assistant_msg = ChatCompletionRequestAssistantMessageArgs::default()
+        .content(reply.clone())
+        .build()
+        .expect("Failed to build assistant message");
+
+    history.push(assistant_msg.into());
 
     // Apply diffs if found
-    match apply_diffs(reply, current_dir) {
+    match apply_diffs(&reply, current_dir) {
         Ok((true, summary)) => {
-            // Update history with concise summary instead of full JSON
+            // Update history with concise summary instead of full text
             if let Some(last) = history.last_mut() {
-                *last = json!({"role": "assistant", "content": summary});
+                let summary_msg = ChatCompletionRequestAssistantMessageArgs::default()
+                    .content(summary)
+                    .build()
+                    .expect("Failed to build assistant message");
+                *last = summary_msg.into();
             }
 
             // Reload context
             let (new_context, file_count) = build_system_prompt(current_dir);
-            history[0] = json!({"role": "system", "content": new_context});
+            if let Some(first) = history.first_mut() {
+                let system_msg = ChatCompletionRequestSystemMessageArgs::default()
+                    .content(new_context)
+                    .build()
+                    .expect("Failed to build system message");
+                *first = system_msg.into();
+            }
             println!("✅ Reloaded {} files into context after edits.", file_count);
         }
         Ok((false, summary)) => {
             // Update history with concise summary even if no files changed
             if let Some(last) = history.last_mut() {
-                *last = json!({"role": "assistant", "content": summary});
+                let summary_msg = ChatCompletionRequestAssistantMessageArgs::default()
+                    .content(summary)
+                    .build()
+                    .expect("Failed to build assistant message");
+                *last = summary_msg.into();
             }
         }
         Err(e) => {
             eprintln!("Error applying diffs: {}", e);
             let error_summary = format!("Error applying edits: {}", e);
             if let Some(last) = history.last_mut() {
-                *last = json!({"role": "assistant", "content": error_summary});
+                let error_msg = ChatCompletionRequestAssistantMessageArgs::default()
+                    .content(error_summary)
+                    .build()
+                    .expect("Failed to build assistant message");
+                *last = error_msg.into();
             }
         }
     }
@@ -170,130 +168,102 @@ async fn main() -> Result<()> {
         context.len()
     );
 
-    let client = Client::new();
+    let config = OpenAIConfig::new()
+        .with_api_base(&args.api_url)
+        .with_api_key("not-needed-for-local");
+    let client = Client::with_config(config);
 
     // Initialize conversational history
-    let mut history = vec![json!({"role": "system", "content": context})];
+    let system_msg = ChatCompletionRequestSystemMessageArgs::default()
+        .content(context)
+        .build()
+        .expect("Failed to build system message");
+    let mut history = vec![system_msg.into()];
+
+    // Initialize rustyline editor
+    let mut rl = DefaultEditor::new().context("Failed to initialize rustyline editor")?;
 
     // 2. REPL Loop
     loop {
-        print!("\nlmcli> ");
-        io::stdout().flush().context("Failed to flush stdout")?;
+        let readline = rl.readline("\nlmcli> ");
+        match readline {
+            Ok(line) => {
+                let input = line.trim();
 
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .context("Failed to read from stdin")?;
-        let input = input.trim();
+                if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
+                    break;
+                }
+                if input.is_empty() {
+                    continue;
+                }
 
-        if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
-            break;
+                // Add to rustyline history
+                let _ = rl.add_history_entry(input);
+
+                let user_msg = ChatCompletionRequestUserMessageArgs::default()
+                    .content(input.to_string())
+                    .build()
+                    .expect("Failed to build user message");
+                history.push(user_msg.into());
+
+                process_llm_interaction(&client, &args, &current_dir, &mut history).await;
+            }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error: {:?}", err);
+                break;
+            }
         }
-        if input.is_empty() {
-            continue;
-        }
-
-        history.push(json!({"role": "user", "content": input}));
-        process_llm_interaction(&client, &args, &current_dir, &mut history).await;
     }
 
     Ok(())
 }
 
-// Finds byte ranges of search strings in file content, ignoring whitespace and line-ending differences, providing a fallback for imperfect LLM outputs.
-fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
-    if search.is_empty() {
-        return vec![];
-    }
+// Pre-processes LLM responses to extract the first markdown code block encountered.
+fn strip_markdown_code_blocks(response: &str) -> String {
+    let parser = MarkdownParser::new(response);
+    let mut in_code_block = false;
+    let mut code_content = String::new();
 
-    let search_lines: Vec<&str> = search.lines().map(str::trim_end).collect();
-    if search_lines.is_empty() {
-        return vec![];
-    }
-
-    let mut orig_lines = Vec::new();
-    let mut current_start = 0;
-
-    for line_raw in original.split_inclusive('\n') {
-        let end = current_start + line_raw.len();
-        let trimmed = line_raw.trim_end();
-        orig_lines.push((trimmed, current_start, end));
-        current_start = end;
-    }
-
-    let mut matches = Vec::new();
-    let mut skip_until = 0;
-    let window_size = search_lines.len();
-
-    for (i, window) in orig_lines.windows(window_size).enumerate() {
-        if i < skip_until {
-            continue;
-        }
-
-        let is_match = window
-            .iter()
-            .zip(&search_lines)
-            .all(|((orig, _, _), search)| orig == search);
-
-        if is_match {
-            let start_byte = window[0].1;
-            let end_byte = window[window_size - 1].2;
-            matches.push((start_byte, end_byte));
-            skip_until = i + window_size; // Skip the matched lines to avoid overlapping matches
-        }
-    }
-
-    matches
-}
-
-// Pre-processes LLM responses to strip markdown formatting, cleanly isolating raw JSON payloads prior to structured deserialization.
-#[allow(clippy::collapsible_if)]
-fn strip_markdown_code_blocks(response: &str) -> &str {
-    let start = response.find(['{', '[']);
-    let end = response.rfind(['}', ']']).map(|i| i + 1);
-
-    if let (Some(s), Some(e)) = (start, end) {
-        if s < e {
-            return &response[s..e];
-        }
-    }
-
-    // Fallback for empty blocks or unparseable JSON
-    let mut stripped = response.trim();
-    if let Some(s) = stripped.strip_prefix("```") {
-        stripped = s.trim_start();
-        if let Some(first_line_end) = stripped.find('\n') {
-            // Strip any language identifiers (e.g., `json`) on the first line
-            // only if the line doesn't already contain JSON structures like { or [
-            if !stripped[..first_line_end].contains(['{', '[']) {
-                stripped = stripped[first_line_end + 1..].trim_start();
+    for event in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code_block = true;
             }
-        } else {
-            // Block is entirely empty or a single line without newlines after ````
-            stripped = "";
+            Event::End(TagEnd::CodeBlock) => {
+                if in_code_block {
+                    // We only care about the *first* code block (assumed to be the unified diff)
+                    return code_content;
+                }
+            }
+            Event::Text(text) => {
+                if in_code_block {
+                    code_content.push_str(&text);
+                }
+            }
+            _ => {}
         }
     }
 
-    if let Some(s) = stripped.strip_suffix("```") {
-        stripped = s.trim_end();
-    }
-
-    stripped
+    // Fallback: If no code blocks were found, return the original response
+    // in case the LLM returned the raw diff directly.
+    response.trim().to_string()
 }
 
-// Applies JSON-structured search-and-replace edits to local files securely, returning a compact LLM-friendly success or failure summary.
+// Applies unified diffs to local files securely, returning a compact LLM-friendly success or failure summary.
 fn apply_diffs(response: &str, current_dir: &Path) -> Result<(bool, String)> {
     let mut files_changed = false;
     let mut summary = String::new();
 
     let cleaned_response = strip_markdown_code_blocks(response);
 
-    // The response string should be a JSON object conforming to `EditResponse`
-    let edit_response: EditResponse = match serde_json::from_str(cleaned_response) {
-        Ok(parsed) => parsed,
+    let patch = match diffy::Patch::from_str(&cleaned_response) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("Error parsing JSON response: {}", e);
-            return Ok((false, format!("Error parsing JSON response: {}", e)));
+            eprintln!("Error parsing unified diff: {}", e);
+            return Ok((false, format!("Error parsing unified diff: {}", e)));
         }
     };
 
@@ -301,21 +271,31 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<(bool, String)> {
         .canonicalize()
         .context("Failed to canonicalize current directory")?;
 
-    for edit in edit_response.edits {
-        let filepath = &edit.filepath;
-        let search_block = &edit.search;
-        let replace_block = &edit.replace;
+    for _hunk in patch.hunks() {
+        let filepath = patch
+            .original()
+            .unwrap_or_else(|| patch.modified().unwrap_or(""));
+        // Remove `a/` or `b/` prefix often found in diffs
+        let filepath = filepath
+            .strip_prefix("a/")
+            .or_else(|| filepath.strip_prefix("b/"))
+            .unwrap_or(filepath);
+
+        if filepath.is_empty() {
+            continue; // Could not determine file
+        }
 
         let full_path = current_dir.join(filepath);
         if !full_path.exists() {
             eprintln!("Warning: File not found: {}", filepath);
             summary.push_str(&format!("Failed to edit {}: File not found.\n", filepath));
-            continue;
+            continue; // Skip file if not found
         }
 
-        let canonical_full_path = full_path
-            .canonicalize()
-            .with_context(|| format!("Failed to canonicalize path {}", filepath))?;
+        let canonical_full_path = match full_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
 
         if !canonical_full_path.starts_with(&canonical_current_dir) {
             anyhow::bail!(
@@ -333,30 +313,13 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<(bool, String)> {
             }
         };
 
-        let new_content = if original_content.contains(search_block) {
-            // Exact match
-            original_content.replace(search_block, replace_block)
-        } else {
-            // Fallback: fuzzy match (ignore line endings and trailing whitespace)
-            let matches = find_all_fuzzy_matches(&original_content, search_block);
-            if matches.is_empty() {
-                eprintln!(
-                    "Warning: Search block not found in {} (even with fuzzy matching)",
-                    filepath
-                );
-                summary.push_str(&format!(
-                    "Failed to edit {}: Search block not found.\n",
-                    filepath
-                ));
+        let new_content = match diffy::apply(&original_content, &patch) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Error applying diff to {}: {}", filepath, e);
+                summary.push_str(&format!("Failed to apply diff to {}: {}\n", filepath, e));
                 continue;
             }
-
-            // Replace all fuzzy matches from right to left to avoid invalidating indices
-            let mut modified_content = original_content.clone();
-            for (start, end) in matches.into_iter().rev() {
-                modified_content.replace_range(start..end, replace_block);
-            }
-            modified_content
         };
 
         if original_content != new_content {
@@ -375,10 +338,14 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<(bool, String)> {
             println!("ℹ️ No changes needed for {}", filepath);
             summary.push_str(&format!("No changes needed for {}.\n", filepath));
         }
+
+        // We applied the whole patch to the file in one go using `diffy::apply` and `patch`
+        // So we can break here since we handled the file.
+        break;
     }
 
     if summary.is_empty() {
-        summary.push_str("No edits requested.\n");
+        summary.push_str("No edits requested or recognized.\n");
     }
 
     Ok((files_changed, summary.trim_end().to_string()))
@@ -390,59 +357,23 @@ mod tests {
 
     #[test]
     fn test_strip_markdown_code_blocks() {
-        // Plain JSON
-        let plain = "{\"foo\": \"bar\"}";
-        assert_eq!(strip_markdown_code_blocks(plain), "{\"foo\": \"bar\"}");
+        // Plain diff without backticks
+        let plain = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-foo\n+bar";
+        assert_eq!(strip_markdown_code_blocks(plain), plain);
 
-        // Wrapped with ```json
-        let wrapped = "```json\n{\"foo\": \"bar\"}\n```";
-        assert_eq!(strip_markdown_code_blocks(wrapped), "{\"foo\": \"bar\"}");
-
-        // Wrapped with upper case JSON
-        let wrapped_upper = "```JSON\n{\"foo\": \"bar\"}\n```";
+        // Wrapped with ```diff
+        let wrapped = "Here is the diff:\n```diff\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-foo\n+bar\n```\nEnjoy!";
         assert_eq!(
-            strip_markdown_code_blocks(wrapped_upper),
-            "{\"foo\": \"bar\"}"
+            strip_markdown_code_blocks(wrapped),
+            "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-foo\n+bar\n"
         );
 
-        // Wrapped with no language tag
-        let wrapped_no_tag = "```\n{\"foo\": \"bar\"}\n```";
-        assert_eq!(
-            strip_markdown_code_blocks(wrapped_no_tag),
-            "{\"foo\": \"bar\"}"
-        );
-
-        // Inline wrapped
-        let inline = "```json{\"foo\": \"bar\"}```";
-        assert_eq!(strip_markdown_code_blocks(inline), "{\"foo\": \"bar\"}");
-
-        // Inline wrapped bracket
-        let inline_bracket = "```json[{\"foo\": \"bar\"}]```";
-        assert_eq!(
-            strip_markdown_code_blocks(inline_bracket),
-            "[{\"foo\": \"bar\"}]"
-        );
-
-        // Leading/trailing whitespace
-        let whitespace = "   \n\n```json\n  {\"foo\": \"bar\"}  \n```   \n\n";
-        assert_eq!(strip_markdown_code_blocks(whitespace), "{\"foo\": \"bar\"}");
+        // Multiple code blocks (should extract first)
+        let multiple = "```diff\nfirst\n```\nSome text\n```rust\nsecond\n```";
+        assert_eq!(strip_markdown_code_blocks(multiple), "first\n");
 
         // Empty block
-        let empty = "```json\n```";
+        let empty = "```diff\n```";
         assert_eq!(strip_markdown_code_blocks(empty), "");
-    }
-
-    #[test]
-    fn test_find_all_fuzzy_matches() {
-        let original = "line1\r\n  line2  \nline3\nline4\r\n";
-        let search = "  line2\nline3\r\n";
-        let matches = find_all_fuzzy_matches(original, search);
-        assert_eq!(matches, vec![(7, 23)]);
-
-        let mut modified = original.to_string();
-        for (start, end) in matches.into_iter().rev() {
-            modified.replace_range(start..end, "replaced\n");
-        }
-        assert_eq!(modified, "line1\r\nreplaced\nline4\r\n");
     }
 }
