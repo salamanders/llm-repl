@@ -35,32 +35,120 @@ struct Args {
 }
 
 // Assembles the initial system prompt by concatenating all valid UTF-8 files to provide codebase context, isolating file ingestion from the main REPL loop.
-fn build_system_prompt(current_dir: &std::path::Path) -> (String, usize) {
-    let mut context = String::from(
+fn build_system_prompt(current_dir: &Path) -> (String, usize) {
+    let initial_context = String::from(
         "You are an expert developer. You provide code edits by responding with a structured JSON object according to the schema provided.\nEnsure that the code in the search block matches the file exactly. Do not truncate or omit parts of the block.\n\nCurrent codebase context:\n\n",
     );
 
-    let mut file_count = 0;
-    for entry in WalkBuilder::new(current_dir)
+    WalkBuilder::new(current_dir)
         .build()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
-    {
-        let path = entry.path();
+        .filter_map(|entry| {
+            let path = entry.path();
+            // read_to_string natively fails on non-UTF8 files (skipping binaries/images)
+            fs::read_to_string(path).ok().map(|content| {
+                let rel_path = path.strip_prefix(current_dir).unwrap_or(path);
+                format!("--- FILE: {} ---\n{}\n\n", rel_path.display(), content)
+            })
+        })
+        .fold((initial_context, 0), |(mut context, count), file_str| {
+            context.push_str(&file_str);
+            (context, count + 1)
+        })
+}
 
-        // read_to_string natively fails on non-UTF8 files (skipping binaries/images)
-        if let Ok(content) = fs::read_to_string(path) {
-            let rel_path = path.strip_prefix(current_dir).unwrap_or(path);
-            context.push_str(&format!(
-                "--- FILE: {} ---\n{}\n\n",
-                rel_path.display(),
-                content
-            ));
-            file_count += 1;
+// Processes the LLM response, applies edits, and manages the history state accordingly.
+async fn process_llm_interaction(
+    client: &Client,
+    args: &Args,
+    current_dir: &Path,
+    history: &mut Vec<serde_json::Value>,
+) {
+    let payload = json!({
+        "model": args.model,
+        "messages": history,
+        "temperature": 0.1, // Low temperature forces deterministic, factual code edits
+        "stream": false,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "edit_response",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "filepath": {"type": "string"},
+                                    "search": {"type": "string"},
+                                    "replace": {"type": "string"}
+                                },
+                                "required": ["filepath", "search", "replace"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["edits"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    });
+
+    match client.post(&args.api_url).json(&payload).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap_or(json!({}));
+
+            if status.is_success() {
+                if let Some(reply) = body["choices"][0]["message"]["content"].as_str() {
+                    println!("\n{}", reply);
+                    history.push(json!({"role": "assistant", "content": reply}));
+
+                    // Apply diffs if found
+                    match apply_diffs(reply, current_dir) {
+                        Ok((true, summary)) => {
+                            // Update history with concise summary instead of full JSON
+                            let last_idx = history.len() - 1;
+                            history[last_idx] = json!({"role": "assistant", "content": summary});
+
+                            // Reload context
+                            let (new_context, file_count) = build_system_prompt(current_dir);
+                            history[0] = json!({"role": "system", "content": new_context});
+                            println!("✅ Reloaded {} files into context after edits.", file_count);
+                        }
+                        Ok((false, summary)) => {
+                            // Update history with concise summary even if no files changed
+                            let last_idx = history.len() - 1;
+                            history[last_idx] = json!({"role": "assistant", "content": summary});
+                        }
+                        Err(e) => {
+                            eprintln!("Error applying diffs: {}", e);
+                            let error_summary = format!("Error applying edits: {}", e);
+                            let last_idx = history.len() - 1;
+                            history[last_idx] =
+                                json!({"role": "assistant", "content": error_summary});
+                        }
+                    }
+                } else {
+                    eprintln!("Error: Malformed response: {}", body);
+                    // Revert the last user message to avoid poisoning the history vector with unanswered prompts
+                    history.pop();
+                }
+            } else {
+                eprintln!("API Error: Status {}. Response: {}", status, body);
+                history.pop();
+            }
+        }
+        Err(e) => {
+            eprintln!("Network Error: {}", e);
+            history.pop();
         }
     }
-
-    (context, file_count)
 }
 
 // Entrypoint for the application, initializing the CLI, managing conversational history state, and orchestrating the REPL loop with the LM API.
@@ -101,98 +189,7 @@ async fn main() -> Result<()> {
         }
 
         history.push(json!({"role": "user", "content": input}));
-
-        let payload = json!({
-            "model": args.model,
-            "messages": history,
-            "temperature": 0.1, // Low temperature forces deterministic, factual code edits
-            "stream": false,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "edit_response",
-                    "strict": true,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "edits": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "filepath": {"type": "string"},
-                                        "search": {"type": "string"},
-                                        "replace": {"type": "string"}
-                                    },
-                                    "required": ["filepath", "search", "replace"],
-                                    "additionalProperties": false
-                                }
-                            }
-                        },
-                        "required": ["edits"],
-                        "additionalProperties": false
-                    }
-                }
-            }
-        });
-
-        let res = client.post(&args.api_url).json(&payload).send().await;
-
-        match res {
-            Ok(response) => {
-                let status = response.status();
-                let body: serde_json::Value = response.json().await.unwrap_or(json!({}));
-
-                if status.is_success() {
-                    if let Some(reply) = body["choices"][0]["message"]["content"].as_str() {
-                        println!("\n{}", reply);
-                        history.push(json!({"role": "assistant", "content": reply}));
-
-                        // Apply diffs if found
-                        match apply_diffs(reply, &current_dir) {
-                            Ok((true, summary)) => {
-                                // Update history with concise summary instead of full JSON
-                                let last_idx = history.len() - 1;
-                                history[last_idx] =
-                                    json!({"role": "assistant", "content": summary});
-
-                                // Reload context
-                                let (new_context, file_count) = build_system_prompt(&current_dir);
-                                history[0] = json!({"role": "system", "content": new_context});
-                                println!(
-                                    "✅ Reloaded {} files into context after edits.",
-                                    file_count
-                                );
-                            }
-                            Ok((false, summary)) => {
-                                // Update history with concise summary even if no files changed
-                                let last_idx = history.len() - 1;
-                                history[last_idx] =
-                                    json!({"role": "assistant", "content": summary});
-                            }
-                            Err(e) => {
-                                eprintln!("Error applying diffs: {}", e);
-                                let error_summary = format!("Error applying edits: {}", e);
-                                let last_idx = history.len() - 1;
-                                history[last_idx] =
-                                    json!({"role": "assistant", "content": error_summary});
-                            }
-                        }
-                    } else {
-                        eprintln!("Error: Malformed response: {}", body);
-                        // Revert the last user message to avoid poisoning the history vector with unanswered prompts
-                        history.pop();
-                    }
-                } else {
-                    eprintln!("API Error: Status {}. Response: {}", status, body);
-                    history.pop();
-                }
-            }
-            Err(e) => {
-                eprintln!("Network Error: {}", e);
-                history.pop();
-            }
-        }
+        process_llm_interaction(&client, &args, &current_dir, &mut history).await;
     }
 
     Ok(())
@@ -220,19 +217,24 @@ fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
     }
 
     let mut matches = Vec::new();
-    let mut i = 0;
-    while i + search_lines.len() <= orig_lines.len() {
-        if orig_lines[i..i + search_lines.len()]
+    let mut skip_until = 0;
+    let window_size = search_lines.len();
+
+    for (i, window) in orig_lines.windows(window_size).enumerate() {
+        if i < skip_until {
+            continue;
+        }
+
+        let is_match = window
             .iter()
             .zip(&search_lines)
-            .all(|((orig, _, _), search)| orig == search)
-        {
-            let start_byte = orig_lines[i].1;
-            let end_byte = orig_lines[i + search_lines.len() - 1].2;
+            .all(|((orig, _, _), search)| orig == search);
+
+        if is_match {
+            let start_byte = window[0].1;
+            let end_byte = window[window_size - 1].2;
             matches.push((start_byte, end_byte));
-            i += search_lines.len(); // Skip the matched lines to avoid overlapping matches
-        } else {
-            i += 1;
+            skip_until = i + window_size; // Skip the matched lines to avoid overlapping matches
         }
     }
 
@@ -240,28 +242,38 @@ fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
 }
 
 // Pre-processes LLM responses to strip markdown formatting, cleanly isolating raw JSON payloads prior to structured deserialization.
+#[allow(clippy::collapsible_if)]
 fn strip_markdown_code_blocks(response: &str) -> &str {
     let start = response.find(['{', '[']);
     let end = response.rfind(['}', ']']).map(|i| i + 1);
 
-    match (start, end) {
-        (Some(s), Some(e)) if s < e => &response[s..e],
-        _ => {
-            // Fallback for empty blocks or unparseable JSON
-            let mut stripped = response.trim();
-            if stripped.starts_with("```") {
-                if let Some(newline_idx) = stripped.find('\n') {
-                    stripped = stripped[newline_idx + 1..].trim_start();
-                } else {
-                    stripped = "";
-                }
-            }
-            if stripped.ends_with("```") {
-                stripped = stripped[..stripped.len().saturating_sub(3)].trim_end();
-            }
-            stripped
+    if let (Some(s), Some(e)) = (start, end) {
+        if s < e {
+            return &response[s..e];
         }
     }
+
+    // Fallback for empty blocks or unparseable JSON
+    let mut stripped = response.trim();
+    if let Some(s) = stripped.strip_prefix("```") {
+        stripped = s.trim_start();
+        if let Some(first_line_end) = stripped.find('\n') {
+            // Strip any language identifiers (e.g., `json`) on the first line
+            // only if the line doesn't already contain JSON structures like { or [
+            if !stripped[..first_line_end].contains(['{', '[']) {
+                stripped = stripped[first_line_end + 1..].trim_start();
+            }
+        } else {
+            // Block is entirely empty or a single line without newlines after ````
+            stripped = "";
+        }
+    }
+
+    if let Some(s) = stripped.strip_suffix("```") {
+        stripped = s.trim_end();
+    }
+
+    stripped
 }
 
 // Applies JSON-structured search-and-replace edits to local files securely, returning a compact LLM-friendly success or failure summary.
