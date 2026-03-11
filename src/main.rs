@@ -221,6 +221,11 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
         }
     };
 
+    let canonical_current_dir = match current_dir.canonicalize() {
+        Ok(path) => path,
+        Err(e) => anyhow::bail!("Failed to canonicalize current directory: {}", e),
+    };
+
     for edit in edit_response.edits {
         let filepath = &edit.filepath;
         let search_block = &edit.search;
@@ -232,7 +237,19 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
             continue;
         }
 
-        let original_content = match fs::read_to_string(&full_path) {
+        let canonical_full_path = match full_path.canonicalize() {
+            Ok(path) => path,
+            Err(e) => anyhow::bail!("Failed to canonicalize path {}: {}", filepath, e),
+        };
+
+        if !canonical_full_path.starts_with(&canonical_current_dir) {
+            anyhow::bail!(
+                "Security Error: Attempted path traversal detected for file: {}",
+                filepath
+            );
+        }
+
+        let original_content = match fs::read_to_string(&canonical_full_path) {
             Ok(content) => content,
             Err(e) => {
                 eprintln!("Error reading file {}: {}", filepath, e);
@@ -263,7 +280,7 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
         };
 
         if original_content != new_content {
-            match fs::write(&full_path, new_content) {
+            match fs::write(&canonical_full_path, new_content) {
                 Ok(_) => {
                     println!("✅ Applied edit to {}", filepath);
                     files_changed = true;
