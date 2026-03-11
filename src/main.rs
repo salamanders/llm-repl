@@ -157,7 +157,12 @@ async fn main() -> Result<()> {
 
                         // Apply diffs if found
                         match apply_diffs(reply, &current_dir) {
-                            Ok(true) => {
+                            Ok((true, summary)) => {
+                                // Update history with concise summary instead of full JSON
+                                let last_idx = history.len() - 1;
+                                history[last_idx] =
+                                    json!({"role": "assistant", "content": summary});
+
                                 // Reload context
                                 let (new_context, file_count) = build_system_prompt(&current_dir);
                                 history[0] = json!({"role": "system", "content": new_context});
@@ -166,11 +171,18 @@ async fn main() -> Result<()> {
                                     file_count
                                 );
                             }
-                            Ok(false) => {
-                                // No diffs applied
+                            Ok((false, summary)) => {
+                                // Update history with concise summary even if no files changed
+                                let last_idx = history.len() - 1;
+                                history[last_idx] =
+                                    json!({"role": "assistant", "content": summary});
                             }
                             Err(e) => {
                                 eprintln!("Error applying diffs: {}", e);
+                                let error_summary = format!("Error applying edits: {}", e);
+                                let last_idx = history.len() - 1;
+                                history[last_idx] =
+                                    json!({"role": "assistant", "content": error_summary});
                             }
                         }
                     } else {
@@ -241,15 +253,18 @@ fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
 }
 
 // Applies diffs found in the structured LLM response
-fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
+// Returns a tuple of (bool, String) where the boolean indicates if files were changed,
+// and the string contains a concise summary of the edits applied or failed.
+fn apply_diffs(response: &str, current_dir: &Path) -> Result<(bool, String)> {
     let mut files_changed = false;
+    let mut summary = String::new();
 
     // The response string should be a JSON object conforming to `EditResponse`
     let edit_response: EditResponse = match serde_json::from_str(response) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("Error parsing JSON response: {}", e);
-            return Ok(false);
+            return Ok((false, format!("Error parsing JSON response: {}", e)));
         }
     };
 
@@ -266,6 +281,7 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
         let full_path = current_dir.join(filepath);
         if !full_path.exists() {
             eprintln!("Warning: File not found: {}", filepath);
+            summary.push_str(&format!("Failed to edit {}: File not found.\n", filepath));
             continue;
         }
 
@@ -285,6 +301,7 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
             Ok(content) => content,
             Err(e) => {
                 eprintln!("Error reading file {}: {}", filepath, e);
+                summary.push_str(&format!("Failed to read {}: {}\n", filepath, e));
                 continue;
             }
         };
@@ -300,6 +317,10 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
                     "Warning: Search block not found in {} (even with fuzzy matching)",
                     filepath
                 );
+                summary.push_str(&format!(
+                    "Failed to edit {}: Search block not found.\n",
+                    filepath
+                ));
                 continue;
             }
 
@@ -315,18 +336,25 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
             match fs::write(&canonical_full_path, new_content) {
                 Ok(_) => {
                     println!("✅ Applied edit to {}", filepath);
+                    summary.push_str(&format!("Successfully edited {}.\n", filepath));
                     files_changed = true;
                 }
                 Err(e) => {
                     eprintln!("Error writing to file {}: {}", filepath, e);
+                    summary.push_str(&format!("Failed to write {}: {}\n", filepath, e));
                 }
             }
         } else {
             println!("ℹ️ No changes needed for {}", filepath);
+            summary.push_str(&format!("No changes needed for {}.\n", filepath));
         }
     }
 
-    Ok(files_changed)
+    if summary.is_empty() {
+        summary.push_str("No edits requested.\n");
+    }
+
+    Ok((files_changed, summary.trim_end().to_string()))
 }
 
 #[cfg(test)]
