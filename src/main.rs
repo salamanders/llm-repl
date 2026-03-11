@@ -193,19 +193,51 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Helper function to normalize line endings and trim trailing whitespace
-fn normalize_content(content: &str) -> String {
-    let mut normalized = content
-        .lines()
-        .map(|line| line.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if content.ends_with('\n') {
-        normalized.push('\n');
+// Finds all fuzzy matches of a search string in the original content.
+// Returns a list of (start_byte, end_byte) tuples indicating the byte range of the match.
+// It ignores differences in line endings and trailing whitespace.
+fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
+    if search.is_empty() {
+        return vec![];
     }
 
-    normalized
+    let search_lines: Vec<&str> = search.split_inclusive('\n').map(|l| l.trim_end()).collect();
+    if search_lines.is_empty() {
+        return vec![];
+    }
+
+    let mut orig_lines = Vec::new();
+    let mut current_start = 0;
+
+    for line_raw in original.split_inclusive('\n') {
+        let end = current_start + line_raw.len();
+        let trimmed = line_raw.trim_end();
+        orig_lines.push((trimmed, current_start, end));
+        current_start = end;
+    }
+
+    let mut matches = Vec::new();
+    let mut i = 0;
+    while i + search_lines.len() <= orig_lines.len() {
+        let mut is_match = true;
+        for j in 0..search_lines.len() {
+            if orig_lines[i + j].0 != search_lines[j] {
+                is_match = false;
+                break;
+            }
+        }
+
+        if is_match {
+            let start_byte = orig_lines[i].1;
+            let end_byte = orig_lines[i + search_lines.len() - 1].2;
+            matches.push((start_byte, end_byte));
+            i += search_lines.len(); // Skip the matched lines to avoid overlapping matches
+        } else {
+            i += 1;
+        }
+    }
+
+    matches
 }
 
 // Applies diffs found in the structured LLM response
@@ -261,22 +293,22 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
             // Exact match
             original_content.replace(search_block, replace_block)
         } else {
-            // Fallback: fuzzy match (normalize line endings and trailing whitespace)
-            let norm_original = normalize_content(&original_content);
-            let norm_search = normalize_content(search_block);
-
-            if norm_original.contains(&norm_search) {
-                // If fuzzy match works, we replace the fuzzy part.
-                // Note: this may alter surrounding whitespace in the original file slightly.
-                let norm_replace = normalize_content(replace_block);
-                norm_original.replace(&norm_search, &norm_replace)
-            } else {
+            // Fallback: fuzzy match (ignore line endings and trailing whitespace)
+            let matches = find_all_fuzzy_matches(&original_content, search_block);
+            if matches.is_empty() {
                 eprintln!(
                     "Warning: Search block not found in {} (even with fuzzy matching)",
                     filepath
                 );
                 continue;
             }
+
+            // Replace all fuzzy matches from right to left to avoid invalidating indices
+            let mut modified_content = original_content.clone();
+            for (start, end) in matches.into_iter().rev() {
+                modified_content.replace_range(start..end, replace_block);
+            }
+            modified_content
         };
 
         if original_content != new_content {
@@ -295,4 +327,23 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<bool> {
     }
 
     Ok(files_changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_all_fuzzy_matches() {
+        let original = "line1\r\n  line2  \nline3\nline4\r\n";
+        let search = "  line2\nline3\r\n";
+        let matches = find_all_fuzzy_matches(original, search);
+        assert_eq!(matches, vec![(7, 23)]);
+
+        let mut modified = original.to_string();
+        for (start, end) in matches.into_iter().rev() {
+            modified.replace_range(start..end, "replaced\n");
+        }
+        assert_eq!(modified, "line1\r\nreplaced\nline4\r\n");
+    }
 }
