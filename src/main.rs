@@ -252,6 +252,40 @@ fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
     matches
 }
 
+// Helper to strip markdown code blocks from LLM output before parsing.
+fn strip_markdown_code_blocks(response: &str) -> &str {
+    let mut stripped = response.trim();
+
+    if stripped.starts_with("```") {
+        if let Some(newline_idx) = stripped.find('\n') {
+            let first_line = &stripped[..newline_idx];
+            // If the first line is just the markdown block and a language specifier (e.g. ```json)
+            if first_line
+                .chars()
+                .all(|c| c == '`' || c.is_alphanumeric() || c.is_whitespace())
+            {
+                stripped = stripped[newline_idx + 1..].trim_start();
+            } else {
+                // There might be valid JSON right after the ``` on the same line, like ```json{
+                if let Some(brace_idx) = first_line.find(['{', '[']) {
+                    stripped = &stripped[brace_idx..];
+                }
+            }
+        } else {
+            // Entire string is on one line. Find `{` or `[`.
+            if let Some(brace_idx) = stripped.find(['{', '[']) {
+                stripped = &stripped[brace_idx..];
+            }
+        }
+    }
+
+    if stripped.ends_with("```") {
+        stripped = stripped[..stripped.len() - 3].trim_end();
+    }
+
+    stripped
+}
+
 // Applies diffs found in the structured LLM response
 // Returns a tuple of (bool, String) where the boolean indicates if files were changed,
 // and the string contains a concise summary of the edits applied or failed.
@@ -259,8 +293,10 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<(bool, String)> {
     let mut files_changed = false;
     let mut summary = String::new();
 
+    let cleaned_response = strip_markdown_code_blocks(response);
+
     // The response string should be a JSON object conforming to `EditResponse`
-    let edit_response: EditResponse = match serde_json::from_str(response) {
+    let edit_response: EditResponse = match serde_json::from_str(cleaned_response) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("Error parsing JSON response: {}", e);
@@ -360,6 +396,50 @@ fn apply_diffs(response: &str, current_dir: &Path) -> Result<(bool, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_strip_markdown_code_blocks() {
+        // Plain JSON
+        let plain = "{\"foo\": \"bar\"}";
+        assert_eq!(strip_markdown_code_blocks(plain), "{\"foo\": \"bar\"}");
+
+        // Wrapped with ```json
+        let wrapped = "```json\n{\"foo\": \"bar\"}\n```";
+        assert_eq!(strip_markdown_code_blocks(wrapped), "{\"foo\": \"bar\"}");
+
+        // Wrapped with upper case JSON
+        let wrapped_upper = "```JSON\n{\"foo\": \"bar\"}\n```";
+        assert_eq!(
+            strip_markdown_code_blocks(wrapped_upper),
+            "{\"foo\": \"bar\"}"
+        );
+
+        // Wrapped with no language tag
+        let wrapped_no_tag = "```\n{\"foo\": \"bar\"}\n```";
+        assert_eq!(
+            strip_markdown_code_blocks(wrapped_no_tag),
+            "{\"foo\": \"bar\"}"
+        );
+
+        // Inline wrapped
+        let inline = "```json{\"foo\": \"bar\"}```";
+        assert_eq!(strip_markdown_code_blocks(inline), "{\"foo\": \"bar\"}");
+
+        // Inline wrapped bracket
+        let inline_bracket = "```json[{\"foo\": \"bar\"}]```";
+        assert_eq!(
+            strip_markdown_code_blocks(inline_bracket),
+            "[{\"foo\": \"bar\"}]"
+        );
+
+        // Leading/trailing whitespace
+        let whitespace = "   \n\n```json\n  {\"foo\": \"bar\"}  \n```   \n\n";
+        assert_eq!(strip_markdown_code_blocks(whitespace), "{\"foo\": \"bar\"}");
+
+        // Empty block
+        let empty = "```json\n```";
+        assert_eq!(strip_markdown_code_blocks(empty), "");
+    }
 
     #[test]
     fn test_find_all_fuzzy_matches() {
