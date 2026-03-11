@@ -204,7 +204,7 @@ fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
         return vec![];
     }
 
-    let search_lines: Vec<&str> = search.split_inclusive('\n').map(|l| l.trim_end()).collect();
+    let search_lines: Vec<&str> = search.lines().map(|l| l.trim_end()).collect();
     if search_lines.is_empty() {
         return vec![];
     }
@@ -222,15 +222,11 @@ fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
     let mut matches = Vec::new();
     let mut i = 0;
     while i + search_lines.len() <= orig_lines.len() {
-        let mut is_match = true;
-        for j in 0..search_lines.len() {
-            if orig_lines[i + j].0 != search_lines[j] {
-                is_match = false;
-                break;
-            }
-        }
-
-        if is_match {
+        if orig_lines[i..i + search_lines.len()]
+            .iter()
+            .zip(&search_lines)
+            .all(|((orig, _, _), search)| orig == search)
+        {
             let start_byte = orig_lines[i].1;
             let end_byte = orig_lines[i + search_lines.len() - 1].2;
             matches.push((start_byte, end_byte));
@@ -245,36 +241,27 @@ fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
 
 // Helper to strip markdown code blocks from LLM output before parsing.
 fn strip_markdown_code_blocks(response: &str) -> &str {
-    let mut stripped = response.trim();
+    let start = response.find(['{', '[']);
+    let end = response.rfind(['}', ']']).map(|i| i + 1);
 
-    if stripped.starts_with("```") {
-        if let Some(newline_idx) = stripped.find('\n') {
-            let first_line = &stripped[..newline_idx];
-            // If the first line is just the markdown block and a language specifier (e.g. ```json)
-            if first_line
-                .chars()
-                .all(|c| c == '`' || c.is_alphanumeric() || c.is_whitespace())
-            {
-                stripped = stripped[newline_idx + 1..].trim_start();
-            } else {
-                // There might be valid JSON right after the ``` on the same line, like ```json{
-                if let Some(brace_idx) = first_line.find(['{', '[']) {
-                    stripped = &stripped[brace_idx..];
+    match (start, end) {
+        (Some(s), Some(e)) if s < e => &response[s..e],
+        _ => {
+            // Fallback for empty blocks or unparseable JSON
+            let mut stripped = response.trim();
+            if stripped.starts_with("```") {
+                if let Some(newline_idx) = stripped.find('\n') {
+                    stripped = stripped[newline_idx + 1..].trim_start();
+                } else {
+                    stripped = "";
                 }
             }
-        } else {
-            // Entire string is on one line. Find `{` or `[`.
-            if let Some(brace_idx) = stripped.find(['{', '[']) {
-                stripped = &stripped[brace_idx..];
+            if stripped.ends_with("```") {
+                stripped = stripped[..stripped.len().saturating_sub(3)].trim_end();
             }
+            stripped
         }
     }
-
-    if stripped.ends_with("```") {
-        stripped = stripped[..stripped.len() - 3].trim_end();
-    }
-
-    stripped
 }
 
 // Applies diffs found in the structured LLM response
