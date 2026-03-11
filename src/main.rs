@@ -34,6 +34,7 @@ struct Args {
     model: String,
 }
 
+// Assembles the initial system prompt by concatenating all valid UTF-8 files to provide codebase context, isolating file ingestion from the main REPL loop.
 fn build_system_prompt(current_dir: &std::path::Path) -> (String, usize) {
     let mut context = String::from(
         "You are an expert developer. You provide code edits by responding with a structured JSON object according to the schema provided.\nEnsure that the code in the search block matches the file exactly. Do not truncate or omit parts of the block.\n\nCurrent codebase context:\n\n",
@@ -62,6 +63,7 @@ fn build_system_prompt(current_dir: &std::path::Path) -> (String, usize) {
     (context, file_count)
 }
 
+// Entrypoint for the application, initializing the CLI, managing conversational history state, and orchestrating the REPL loop with the LM API.
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -196,9 +198,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Finds all fuzzy matches of a search string in the original content.
-// Returns a list of (start_byte, end_byte) tuples indicating the byte range of the match.
-// It ignores differences in line endings and trailing whitespace.
+// Finds byte ranges of search strings in file content, ignoring whitespace and line-ending differences, providing a fallback for imperfect LLM outputs.
 fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
     if search.is_empty() {
         return vec![];
@@ -239,7 +239,7 @@ fn find_all_fuzzy_matches(original: &str, search: &str) -> Vec<(usize, usize)> {
     matches
 }
 
-// Helper to strip markdown code blocks from LLM output before parsing.
+// Pre-processes LLM responses to strip markdown formatting, cleanly isolating raw JSON payloads prior to structured deserialization.
 fn strip_markdown_code_blocks(response: &str) -> &str {
     let start = response.find(['{', '[']);
     let end = response.rfind(['}', ']']).map(|i| i + 1);
@@ -264,9 +264,7 @@ fn strip_markdown_code_blocks(response: &str) -> &str {
     }
 }
 
-// Applies diffs found in the structured LLM response
-// Returns a tuple of (bool, String) where the boolean indicates if files were changed,
-// and the string contains a concise summary of the edits applied or failed.
+// Applies JSON-structured search-and-replace edits to local files securely, returning a compact LLM-friendly success or failure summary.
 fn apply_diffs(response: &str, current_dir: &Path) -> Result<(bool, String)> {
     let mut files_changed = false;
     let mut summary = String::new();
